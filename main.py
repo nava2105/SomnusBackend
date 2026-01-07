@@ -1,5 +1,5 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, status
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from typing import List
@@ -8,6 +8,9 @@ import os
 import json
 import base64
 from pathlib import Path
+# ✅ Importamos Mongo y Auth (los archivos que ya creaste)
+from db import users
+from auth import hash_password, verify_password, create_token
 
 app = FastAPI()
 
@@ -20,6 +23,56 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# MODELOS PARA AUTH (REGISTRO Y LOGIN)
+
+class RegisterIn(BaseModel):
+    name: str = Field(..., min_length=2, max_length=60)
+    password: str = Field(..., min_length=6, max_length=128)
+    confirm_password: str = Field(..., min_length=6, max_length=128)
+
+
+class LoginIn(BaseModel):
+    name: str = Field(..., min_length=2, max_length=60)
+    password: str = Field(..., min_length=6, max_length=128)
+
+# ENDPOINTS AUTH
+
+@app.post("/auth/register", status_code=201)
+async def register(payload: RegisterIn):
+    name = payload.name.strip().lower()
+
+    if payload.password != payload.confirm_password:
+        raise HTTPException(status_code=400, detail="Las contraseñas no coinciden")
+
+    existing = await users.find_one({"name": name})
+    if existing:
+        raise HTTPException(status_code=409, detail="El usuario ya existe")
+
+    user_doc = {
+        "name": name,
+        "password_hash": hash_password(payload.password),
+        "created_at": datetime.utcnow()
+    }
+
+    await users.insert_one(user_doc)
+
+    return {"status": "success", "message": "Usuario registrado correctamente"}
+
+
+@app.post("/auth/login")
+async def login(payload: LoginIn):
+    name = payload.name.strip().lower()
+
+    user = await users.find_one({"name": name})
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales incorrectas")
+
+    if not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales incorrectas")
+
+    token = create_token(subject=name)
+
+    return {"access_token": token, "token_type": "bearer"}
 
 # Pydantic models for data validation
 class UserTimeSetting(BaseModel):
