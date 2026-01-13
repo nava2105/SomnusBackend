@@ -1,16 +1,22 @@
-from fastapi import FastAPI, HTTPException, status
+import os
+from datetime import datetime, timedelta
+from jose import jwt
+from dotenv import load_dotenv
+import uvicorn
+from fastapi import FastAPI, HTTPException, status, Query
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-from typing import List
-from datetime import datetime
-import os
+from typing import List, Optional
 import json
 import base64
 from pathlib import Path
-# ✅ Importamos Mongo y Auth (los archivos que ya creaste)
+import redis
+import random
+import numpy as np
 from db import users
 from auth import hash_password, verify_password, create_token
+
+load_dotenv()
 
 app = FastAPI()
 
@@ -23,8 +29,66 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# MODELOS PARA AUTH (REGISTRO Y LOGIN)
+r = redis.Redis(host="localhost", port=6379, decode_responses=False)
 
+def get_random_songs(n=5):
+    """
+    Gets n random songs from Redis with their embeddings
+    """
+    # Get all songs keys:*
+    keys = []
+    for key in r.scan_iter("song:*"):
+        keys.append(key)
+
+    if not keys:
+        print("⚠ No songs found in Redis")
+        return []
+
+    # Select n random keys without repeating
+    selected_keys = random.sample(keys, min(n, len(keys)))
+
+    # Get data for each song
+    songs = []
+    for key in selected_keys:
+        song_data = r.hgetall(key)
+
+        # Decode the embedding of bytes to a list of floats
+        embedding_bytes = song_data[b"embedding"]
+        embedding_array = np.frombuffer(embedding_bytes, dtype=np.float32)
+
+        songs.append({
+            "title": song_data[b"title"].decode(),
+            "composer": song_data[b"composer"].decode(),
+            "form": song_data[b"form"].decode(),
+            "period": song_data[b"period"].decode(),
+            "mp3_url": song_data[b"mp3_url"].decode(),
+            "embedding": embedding_array.tolist()
+        })
+
+    return songs
+
+
+def recommend(song_embedding, k=50, max_results=20):
+    query_vector = np.array(song_embedding, dtype=np.float32).tobytes()
+
+    q = (
+            "*=>[KNN %d @embedding $vec AS score]"
+            % k
+    )
+
+    result = r.execute_command(
+        "FT.SEARCH", "idx:songs", q,
+        "PARAMS", "2", "vec", query_vector,
+        "SORTBY", "score",
+        "RETURN", "5", "title", "composer", "form", "mp3_url", "score",
+        "LIMIT", "0", str(max_results),
+        "DIALECT", "2"
+    )
+
+    return result
+
+
+# AUTH MODELS
 class RegisterIn(BaseModel):
     name: str = Field(..., min_length=2, max_length=60)
     password: str = Field(..., min_length=6, max_length=128)
@@ -35,46 +99,15 @@ class LoginIn(BaseModel):
     name: str = Field(..., min_length=2, max_length=60)
     password: str = Field(..., min_length=6, max_length=128)
 
-# ENDPOINTS AUTH
 
-@app.post("/auth/register", status_code=201)
-async def register(payload: RegisterIn):
-    name = payload.name.strip().lower()
-
-    if payload.password != payload.confirm_password:
-        raise HTTPException(status_code=400, detail="Las contraseñas no coinciden")
-
-    existing = await users.find_one({"name": name})
-    if existing:
-        raise HTTPException(status_code=409, detail="El usuario ya existe")
-
-    user_doc = {
-        "name": name,
-        "password_hash": hash_password(payload.password),
-        "created_at": datetime.utcnow()
-    }
-
-    await users.insert_one(user_doc)
-
-    return {"status": "success", "message": "Usuario registrado correctamente"}
+# SONG MODELS
+class Song(BaseModel):
+    title: str
+    composer: str  # Author of the song
+    mp3_url: str   # URL to the audio file
 
 
-@app.post("/auth/login")
-async def login(payload: LoginIn):
-    name = payload.name.strip().lower()
-
-    user = await users.find_one({"name": name})
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales incorrectas")
-
-    if not verify_password(payload.password, user["password_hash"]):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales incorrectas")
-
-    token = create_token(subject=name)
-
-    return {"access_token": token, "token_type": "bearer"}
-
-# Pydantic models for data validation
+# USER DATA MODELS
 class UserTimeSetting(BaseModel):
     hour: int
     minute: int
@@ -143,7 +176,7 @@ class SleepScore(BaseModel):
 
 
 class SleepSessionData(BaseModel):
-    username: str  # Added username field
+    username: str
     startTime: str
     endTime: str
     duration: int
@@ -153,114 +186,22 @@ class SleepSessionData(BaseModel):
     summary: dict
 
 
-# In-memory storage (replace with database in production)
-recommendations_db = [
-    {
-        "id": "1",
-        "title": "Maintain Consistent Sleep Schedule",
-        "brief_explanation": "Going to bed and waking up at the same time helps regulate your circadian rhythm.",
-        "detailed_explanation": "Your body has an internal clock called the circadian rhythm. When you maintain consistent sleep times, you reinforce this rhythm, making it easier to fall asleep and wake up naturally. This can improve sleep quality by up to 23%."
-    },
-    {
-        "id": "2",
-        "title": "Reduce Screen Time Before Bed",
-        "brief_explanation": "Avoid phones and tablets 1 hour before bedtime to improve melatonin production.",
-        "detailed_explanation": "Blue light from screens suppresses melatonin production, the hormone that regulates sleep. Studies show that reducing screen time 1-2 hours before bed can help you fall asleep 30% faster and increase REM sleep duration."
-    },
-    {
-        "id": "3",
-        "title": "Optimize Room Temperature",
-        "brief_explanation": "Keep your bedroom between 65-68°F (18-20°C) for optimal sleep.",
-        "detailed_explanation": "Core body temperature naturally drops during sleep. A cooler room helps facilitate this process. Research indicates that temperatures between 65-68°F promote deeper sleep and reduce nighttime awakenings."
-    },
-]
+class SongRecommendationRequest(BaseModel):
+    song_title: str = Field(..., description="Title of the song to get recommendations for")
+    k: int = Field(default=50, ge=1, le=100, description="Number of similar songs to search for")
+    max_results: int = Field(default=20, ge=1, le=50, description="Maximum number of results to return")
 
-# Mock sleep data
-weekly_sleep_data = [
-    {"day": "Sun", "asleep": 40, "awake": 58, "pickups": 2},
-    {"day": "Mon", "asleep": 25, "awake": 67, "pickups": 8},
-    {"day": "Tue", "asleep": 35, "awake": 60, "pickups": 5},
-    {"day": "Wed", "asleep": 33, "awake": 53, "pickups": 14},
-    {"day": "Thu", "asleep": 21, "awake": 78, "pickups": 1},
-    {"day": "Fri", "asleep": 50, "awake": 46, "pickups": 4},
-    {"day": "Sat", "asleep": 35, "awake": 62, "pickups": 3},
-]
 
-monthly_sleep_data = [
-    # September 2025 data
-    {"date": "2025-11-01", "score": 85, "day": 1},
-    {"date": "2025-11-02", "score": 92, "day": 2},
-    {"date": "2025-11-03", "score": 78, "day": 3},
-    {"date": "2025-11-04", "score": 65, "day": 4},
-    {"date": "2025-11-05", "score": 88, "day": 5},
-    {"date": "2025-11-06", "score": 95, "day": 6},
-    {"date": "2025-11-07", "score": 82, "day": 7},
-    {"date": "2025-11-08", "score": 91, "day": 8},
-    {"date": "2025-11-09", "score": 73, "day": 9},
-    {"date": "2025-11-10", "score": 55, "day": 10},
-    {"date": "2025-11-11", "score": 89, "day": 11},
-    {"date": "2025-11-12", "score": 86, "day": 12},
-    {"date": "2025-11-13", "score": 93, "day": 13},
-    {"date": "2025-11-14", "score": 79, "day": 14},
-    {"date": "2025-11-15", "score": 68, "day": 15},
-    {"date": "2025-11-16", "score": 84, "day": 16},
-    {"date": "2025-11-17", "score": 77, "day": 17},
-    {"date": "2025-11-18", "score": 90, "day": 18},
-    {"date": "2025-11-19", "score": 88, "day": 19},
-    {"date": "2025-11-20", "score": 52, "day": 20},
-    {"date": "2025-11-21", "score": 83, "day": 21},
-    {"date": "2025-11-22", "score": 76, "day": 22},
-    {"date": "2025-11-23", "score": 94, "day": 23},
-    {"date": "2025-11-24", "score": 81, "day": 24},
-    {"date": "2025-11-25", "score": 71, "day": 25},
-    {"date": "2025-11-26", "score": 87, "day": 26},
-    {"date": "2025-11-27", "score": 69, "day": 27},
-    {"date": "2025-11-28", "score": 58, "day": 28},
-    {"date": "2025-11-29", "score": 85, "day": 29},
-    {"date": "2025-11-30", "score": 92, "day": 30},
-    {"date": "2025-12-01", "score": 66, "day": 1},
-    {"date": "2025-12-02", "score": 63, "day": 2},
-    {"date": "2025-12-03", "score": 70, "day": 3},
-    {"date": "2025-12-04", "score": 78, "day": 4},
-    {"date": "2025-12-05", "score": 88, "day": 5},
-    {"date": "2025-12-06", "score": 81, "day": 6},
-    {"date": "2025-12-07", "score": 59, "day": 7},
-    {"date": "2025-12-08", "score": 79, "day": 8},
-    {"date": "2025-12-09", "score": 89, "day": 9},
-    {"date": "2025-12-10", "score": 85, "day": 10},
-    {"date": "2025-12-11", "score": 95, "day": 11},
-    {"date": "2025-12-12", "score": 79, "day": 12},
-    {"date": "2025-12-13", "score": 74, "day": 13},
-    {"date": "2025-12-14", "score": 69, "day": 14},
-    {"date": "2025-12-15", "score": 81, "day": 15},
-]
+class SongRecommendation(BaseModel):
+    title: str
+    composer: str
+    form: str
+    period: str
+    mp3_url: str
+    similarity_score: float
 
-night_pattern_data = {
-    "points": [
-        # Initial period - getting to sleep
-        {"time": "22:00", "value": 0}, {"time": "22:05", "value": 0.1}, {"time": "22:10", "value": 0.2},
-        {"time": "22:15", "value": 0.4}, {"time": "22:20", "value": 0.6}, {"time": "22:25", "value": 0.8},
-        # Deep sleep phase
-        {"time": "22:30", "value": 1.0}, {"time": "22:35", "value": 1.0}, {"time": "22:40", "value": 0.9},
-        {"time": "22:45", "value": 0.95}, {"time": "22:50", "value": 1.0}, {"time": "22:55", "value": 1.0},
-        {"time": "23:00", "value": 0.9}, {"time": "23:05", "value": 1.0}, {"time": "23:10", "value": 0.8},
-        # REM/light sleep cycle
-        {"time": "23:15", "value": 0.6}, {"time": "23:20", "value": 0.7}, {"time": "23:25", "value": 0.9},
-        {"time": "23:30", "value": 1.0}, {"time": "23:35", "value": 0.95}, {"time": "23:40", "value": 0.7},
-        {"time": "23:45", "value": 0.4}, {"time": "23:50", "value": 0.6}, {"time": "23:55", "value": 0.8},
-        # Continued through the night...
-        {"time": "00:00", "value": 1.0}, {"time": "00:30", "value": 0.9}, {"time": "01:00", "value": 1.0},
-        {"time": "01:30", "value": 0.7}, {"time": "02:00", "value": 0.8}, {"time": "02:30", "value": 1.0},
-        {"time": "03:00", "value": 0.9}, {"time": "03:30", "value": 0.6}, {"time": "04:00", "value": 0.7},
-        {"time": "04:30", "value": 0.8}, {"time": "05:00", "value": 0.9}, {"time": "05:30", "value": 0.6},
-        {"time": "06:00", "value": 0.4}, {"time": "06:30", "value": 0.2}, {"time": "07:00", "value": 0},
-    ],
-    "events": [
-        {"time": "03:55", "type": "pickup"},
-        {"time": "10:11", "type": "wakeup"},
-    ]
-}
 
+# ENDPOINTS
 
 @app.get("/")
 async def root():
@@ -278,12 +219,241 @@ async def health_check():
     return {"status": "healthy", "message": "API is running"}
 
 
+@app.post("/auth/register", status_code=201)
+async def register(payload: RegisterIn):
+    name = payload.name.strip().lower()
+
+    if payload.password != payload.confirm_password:
+        raise HTTPException(status_code=400, detail="Las contraseñas no coinciden")
+
+    existing = await users.find_one({"name": name})
+    if existing:
+        raise HTTPException(status_code=409, detail="El usuario ya existe")
+
+    user_doc = {
+        "name": name,
+        "password_hash": hash_password(payload.password),
+        "created_at": datetime.utcnow()
+    }
+
+    await users.insert_one(user_doc)
+
+    return {"status": "success", "message": "Usuario registrado correctamente"}
+
+
+@app.post("/auth/login")
+async def login(payload: LoginIn):
+    name = payload.name.strip().lower()
+
+    user = await users.find_one({"name": name})
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales incorrectas")
+
+    if not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales incorrectas")
+
+    token = create_token(subject=name)
+
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@app.post("/api/songs/recommend", response_model=List[SongRecommendation])
+async def get_song_recommendations(request: SongRecommendationRequest):
+    """
+    Get song recommendations based on vector similarity using a selected song as reference.
+    Uses Redis vector search to find songs with similar musical characteristics.
+    """
+    try:
+        # First, find the reference song in Redis
+        reference_song = None
+        for key in r.scan_iter("song:*"):
+            song_data = r.hgetall(key)
+            if song_data[b"title"].decode() == request.song_title:
+                # Decode the embedding
+                embedding_bytes = song_data[b"embedding"]
+                embedding_array = np.frombuffer(embedding_bytes, dtype=np.float32)
+                reference_song = {
+                    "title": song_data[b"title"].decode(),
+                    "embedding": embedding_array.tolist()
+                }
+                break
+
+        if not reference_song:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Song '{request.song_title}' not found in database"
+            )
+
+        # Use the recommend function to find similar songs
+        result = recommend(
+            song_embedding=reference_song["embedding"],
+            k=request.k,
+            max_results=request.max_results
+        )
+
+        # Parse the Redis search results
+        # Format: [total_results, key1, [field1, value1, field2, value2, ...], key2, [...], ...]
+        recommendations = []
+
+        if result and len(result) > 1:
+            total_results = result[0]
+            i = 1
+
+            while i < len(result):
+                # Get the key
+                key = result[i]
+                i += 1
+
+                # Get the fields array
+                if i < len(result) and isinstance(result[i], list):
+                    fields = result[i]
+                    i += 1
+
+                    # Parse fields into a dictionary
+                    field_dict = {}
+                    for j in range(0, len(fields), 2):
+                        if j + 1 < len(fields):
+                            field_name = fields[j]
+                            field_value = fields[j + 1]
+
+                            # Decode bytes to string
+                            if isinstance(field_name, bytes):
+                                field_name = field_name.decode()
+                            if isinstance(field_value, bytes):
+                                field_value = field_value.decode()
+
+                            field_dict[field_name] = field_value
+
+                    # Extract the score (it's in the field list with the alias "score")
+                    score = float(field_dict.get("score", 0))
+
+                    # Create recommendation object
+                    recommendation = {
+                        "title": field_dict.get("title", ""),
+                        "composer": field_dict.get("composer", ""),
+                        "form": field_dict.get("form", ""),
+                        "period": field_dict.get("period", ""),
+                        "mp3_url": field_dict.get("mp3_url", ""),
+                        "similarity_score": score
+                    }
+
+                    # Filter out the reference song itself
+                    if recommendation["title"] != request.song_title:
+                        recommendations.append(recommendation)
+                else:
+                    # Skip if format is unexpected
+                    continue
+
+        return recommendations
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error generating recommendations: {str(e)}"
+        )
+
+
+# Optional: Add this helper endpoint to get available songs for recommendation
+
+@app.get("/api/songs/available", response_model=List[Song])
+async def get_available_songs(
+        limit: int = Query(default=50, ge=1, le=200, description="Maximum number of songs to return")
+):
+    """
+    Get list of available songs in the database for recommendation purposes
+    """
+    try:
+        songs = []
+        count = 0
+
+        for key in r.scan_iter("song:*"):
+            if count >= limit:
+                break
+
+            song_data = r.hgetall(key)
+            songs.append({
+                "title": song_data[b"title"].decode(),
+                "composer": song_data[b"composer"].decode(),
+                "mp3_url": song_data[b"mp3_url"].decode(),
+            })
+            count += 1
+
+        return songs
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving songs: {str(e)}"
+        )
+
+
+@app.get("/api/songs/random", response_model=List[Song])
+async def get_random_songs_endpoint(
+        n: int = Query(default=5, ge=1, le=20, description="Number of random songs to retrieve")
+):
+    """
+    Get random songs from the Redis database
+    Returns: List of songs with title, composer (author), and mp3_url
+    - **n**: Number of songs to retrieve (1-20)
+    """
+    try:
+        keys = []
+        for key in r.scan_iter("song:*"):
+            keys.append(key)
+
+        if not keys:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No songs found in database"
+            )
+
+        selected_keys = random.sample(keys, min(n, len(keys)))
+        songs = []
+
+        for key in selected_keys:
+            song_data = r.hgetall(key)
+            songs.append({
+                "title": song_data[b"title"].decode(),
+                "composer": song_data[b"composer"].decode(),
+                "mp3_url": song_data[b"mp3_url"].decode(),
+            })
+
+        return songs
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving songs: {str(e)}"
+        )
+
+
 @app.get("/api/recommendations", response_model=List[Recommendation])
 async def get_recommendations():
     """
     Get all sleep recommendations
     """
-    return recommendations_db
+    return [
+        {
+            "id": "1",
+            "title": "Maintain Consistent Sleep Schedule",
+            "brief_explanation": "Going to bed and waking up at the same time helps regulate your circadian rhythm.",
+            "detailed_explanation": "Your body has an internal clock called the circadian rhythm. When you maintain consistent sleep times, you reinforce this rhythm, making it easier to fall asleep and wake up naturally. This can improve sleep quality by up to 23%."
+        },
+        {
+            "id": "2",
+            "title": "Reduce Screen Time Before Bed",
+            "brief_explanation": "Avoid phones and tablets 1 hour before bedtime to improve melatonin production.",
+            "detailed_explanation": "Blue light from screens suppresses melatonin production, the hormone that regulates sleep. Studies show that reducing screen time 1-2 hours before bed can help you fall asleep 30% faster and increase REM sleep duration."
+        },
+        {
+            "id": "3",
+            "title": "Optimize Room Temperature",
+            "brief_explanation": "Keep your bedroom between 65-68°F (18-20°C) for optimal sleep.",
+            "detailed_explanation": "Core body temperature naturally drops during sleep. A cooler room helps facilitate this process. Research indicates that temperatures between 65-68°F promote deeper sleep and reduce nighttime awakenings."
+        },
+    ]
 
 
 @app.get("/api/sleep/weekly-data", response_model=List[DayData])
@@ -292,7 +462,15 @@ async def get_weekly_data():
     Get weekly sleep data for bar chart
     Returns: Array of daily sleep metrics
     """
-    return weekly_sleep_data
+    return [
+        {"day": "Sun", "asleep": 40, "awake": 58, "pickups": 2},
+        {"day": "Mon", "asleep": 25, "awake": 67, "pickups": 8},
+        {"day": "Tue", "asleep": 35, "awake": 60, "pickups": 5},
+        {"day": "Wed", "asleep": 33, "awake": 53, "pickups": 14},
+        {"day": "Thu", "asleep": 21, "awake": 78, "pickups": 1},
+        {"day": "Fri", "asleep": 50, "awake": 46, "pickups": 4},
+        {"day": "Sat", "asleep": 35, "awake": 62, "pickups": 3},
+    ]
 
 
 @app.get("/api/sleep/monthly-data", response_model=List[MonthlyDayData])
@@ -301,7 +479,53 @@ async def get_monthly_data():
     Get monthly sleep data for calendar view
     Returns: Array of daily sleep scores
     """
-    return monthly_sleep_data
+    return [
+        {"date": "2025-11-01", "score": 85, "day": 1},
+        {"date": "2025-11-02", "score": 92, "day": 2},
+        {"date": "2025-11-03", "score": 78, "day": 3},
+        {"date": "2025-11-04", "score": 65, "day": 4},
+        {"date": "2025-11-05", "score": 88, "day": 5},
+        {"date": "2025-11-06", "score": 95, "day": 6},
+        {"date": "2025-11-07", "score": 82, "day": 7},
+        {"date": "2025-11-08", "score": 91, "day": 8},
+        {"date": "2025-11-09", "score": 73, "day": 9},
+        {"date": "2025-11-10", "score": 55, "day": 10},
+        {"date": "2025-11-11", "score": 89, "day": 11},
+        {"date": "2025-11-12", "score": 86, "day": 12},
+        {"date": "2025-11-13", "score": 93, "day": 13},
+        {"date": "2025-11-14", "score": 79, "day": 14},
+        {"date": "2025-11-15", "score": 68, "day": 15},
+        {"date": "2025-11-16", "score": 84, "day": 16},
+        {"date": "2025-11-17", "score": 77, "day": 17},
+        {"date": "2025-11-18", "score": 90, "day": 18},
+        {"date": "2025-11-19", "score": 88, "day": 19},
+        {"date": "2025-11-20", "score": 52, "day": 20},
+        {"date": "2025-11-21", "score": 83, "day": 21},
+        {"date": "2025-11-22", "score": 76, "day": 22},
+        {"date": "2025-11-23", "score": 94, "day": 23},
+        {"date": "2025-11-24", "score": 81, "day": 24},
+        {"date": "2025-11-25", "score": 71, "day": 25},
+        {"date": "2025-11-26", "score": 87, "day": 26},
+        {"date": "2025-11-27", "score": 69, "day": 27},
+        {"date": "2025-11-28", "score": 58, "day": 28},
+        {"date": "2025-11-29", "score": 85, "day": 29},
+        {"date": "2025-11-30", "score": 92, "day": 30},
+        {"date": "2025-12-01", "score": 66, "day": 1},
+        {"date": "2025-12-02", "score": 63, "day": 2},
+        {"date": "2025-12-03", "score": 70, "day": 3},
+        {"date": "2025-12-04", "score": 78, "day": 4},
+        {"date": "2025-12-05", "score": 88, "day": 5},
+        {"date": "2025-12-06", "score": 81, "day": 6},
+        {"date": "2025-12-07", "score": 59, "day": 7},
+        {"date": "2025-12-08", "score": 79, "day": 8},
+        {"date": "2025-12-09", "score": 89, "day": 9},
+        {"date": "2025-12-10", "score": 85, "day": 10},
+        {"date": "2025-12-11", "score": 95, "day": 11},
+        {"date": "2025-12-12", "score": 79, "day": 12},
+        {"date": "2025-12-13", "score": 74, "day": 13},
+        {"date": "2025-12-14", "score": 69, "day": 14},
+        {"date": "2025-12-15", "score": 81, "day": 15},
+    ]
 
 
 @app.get("/api/sleep/sleep-distribution", response_model=SleepDistribution)
@@ -310,7 +534,6 @@ async def get_sleep_distribution():
     Get sleep phase distribution for pie/arc chart
     Returns: Percentages for awake, pickups, and asleep time
     """
-    # In production, calculate this from actual data
     return {
         "awake": 60,
         "pickups": 5,
@@ -336,7 +559,27 @@ async def get_night_pattern():
     Get detailed night sleep pattern data
     Returns: Graph points and events
     """
-    return night_pattern_data
+    return {
+        "points": [
+            {"time": "22:00", "value": 0}, {"time": "22:05", "value": 0.1}, {"time": "22:10", "value": 0.2},
+            {"time": "22:15", "value": 0.4}, {"time": "22:20", "value": 0.6}, {"time": "22:25", "value": 0.8},
+            {"time": "22:30", "value": 1.0}, {"time": "22:35", "value": 1.0}, {"time": "22:40", "value": 0.9},
+            {"time": "22:45", "value": 0.95}, {"time": "22:50", "value": 1.0}, {"time": "22:55", "value": 1.0},
+            {"time": "23:00", "value": 0.9}, {"time": "23:05", "value": 1.0}, {"time": "23:10", "value": 0.8},
+            {"time": "23:15", "value": 0.6}, {"time": "23:20", "value": 0.7}, {"time": "23:25", "value": 0.9},
+            {"time": "23:30", "value": 1.0}, {"time": "23:35", "value": 0.95}, {"time": "23:40", "value": 0.7},
+            {"time": "23:45", "value": 0.4}, {"time": "23:50", "value": 0.6}, {"time": "23:55", "value": 0.8},
+            {"time": "00:00", "value": 1.0}, {"time": "00:30", "value": 0.9}, {"time": "01:00", "value": 1.0},
+            {"time": "01:30", "value": 0.7}, {"time": "02:00", "value": 0.8}, {"time": "02:30", "value": 1.0},
+            {"time": "03:00", "value": 0.9}, {"time": "03:30", "value": 0.6}, {"time": "04:00", "value": 0.7},
+            {"time": "04:30", "value": 0.8}, {"time": "05:00", "value": 0.9}, {"time": "05:30", "value": 0.6},
+            {"time": "06:00", "value": 0.4}, {"time": "06:30", "value": 0.2}, {"time": "07:00", "value": 0},
+        ],
+        "events": [
+            {"time": "03:55", "type": "pickup"},
+            {"time": "10:11", "type": "wakeup"},
+        ]
+    }
 
 
 @app.post("/api/user/profile")
@@ -405,12 +648,10 @@ async def receive_sleep_session(session: SleepSessionData):
     print(f"Motion Events: {len(session.motionData)}")
     print(f"Light Readings: {len(session.lightData)}")
 
-    # Create directory structure: data/{username}/{timestamp}/
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     session_dir = Path(f"data/{session.username}/{timestamp}")
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save audio file if present
     audio_saved = False
     if session.audioData and len(session.audioData) > 0:
         audio_entry = session.audioData[0]
@@ -425,7 +666,6 @@ async def receive_sleep_session(session: SleepSessionData):
             except Exception as e:
                 print(f"Failed to save audio file: {e}")
 
-    # Save motion data
     try:
         motion_path = session_dir / "motion.json"
         with open(motion_path, "w") as f:
@@ -434,7 +674,6 @@ async def receive_sleep_session(session: SleepSessionData):
     except Exception as e:
         print(f"Failed to save motion data: {e}")
 
-    # Save light data
     try:
         light_path = session_dir / "light.json"
         with open(light_path, "w") as f:
@@ -443,7 +682,6 @@ async def receive_sleep_session(session: SleepSessionData):
     except Exception as e:
         print(f"Failed to save light data: {e}")
 
-    # Save session metadata
     try:
         session_path = session_dir / "session.json"
         session_metadata = {

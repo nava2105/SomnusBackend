@@ -1,4 +1,3 @@
-# auth.py
 import os
 from datetime import datetime, timedelta
 from jose import jwt
@@ -12,10 +11,10 @@ JWT_ALG = "HS256"
 JWT_EXPIRE_MINUTES = 60 * 24
 
 def hash_password(password: str) -> str:
-    # bcrypt solo acepta bytes
+    # bcrypt accepts only bytes
     salt = bcrypt.gensalt(rounds=12)
     hashed = bcrypt.hashpw(password.encode("utf-8"), salt)
-    return hashed.decode("utf-8")  # guardamos string en Mongo
+    return hashed.decode("utf-8")  # save string in Mongo
 
 def verify_password(password: str, password_hash: str) -> bool:
     return bcrypt.checkpw(
