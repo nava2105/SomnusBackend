@@ -88,6 +88,115 @@ def recommend(song_embedding, k=50, max_results=20):
     return result
 
 
+def get_total_sleep_recommendations():
+    """Get the total number of sleep recommendations in the index"""
+    try:
+        info = r.execute_command("FT.INFO", "idx:sleep_recommendations")
+        for i in range(0, len(info), 2):
+            if info[i] == b'num_docs':
+                return int(info[i + 1])
+        return 0
+    except Exception as e:
+        print(f"Error getting total recommendations: {e}")
+        return 0
+
+
+def get_random_sleep_recommendations(n=5):
+    """Get n random sleep recommendations from Redis"""
+    keys = []
+    for key in r.scan_iter("sleep:*"):
+        keys.append(key)
+
+    if not keys:
+        print("⚠ No sleep recommendations found in Redis")
+        return []
+
+    selected_keys = random.sample(keys, min(n, len(keys)))
+    recommendations = []
+
+    for key in selected_keys:
+        data = r.hgetall(key)
+
+        recommendations.append({
+            "title": data[b"title"].decode(),
+            "brief_description": data[b"brief_description"].decode(),
+            "detailed_description": data[b"detailed_description"].decode()
+        })
+
+    return recommendations
+
+
+def search_similar_recommendations(embedding_query, k=None, max_results=None):
+    """Search for similar sleep recommendations using vector similarity"""
+    total_docs = get_total_sleep_recommendations()
+    if k is None:
+        k = total_docs if total_docs > 0 else 1000
+    if max_results is None:
+        max_results = total_docs if total_docs > 0 else 1000
+
+    query_vector = np.array(embedding_query, dtype=np.float32).tobytes()
+    q = "*=>[KNN %d @embedding $vec AS score]" % k
+
+    result = r.execute_command(
+        "FT.SEARCH", "idx:sleep_recommendations", q,
+        "PARAMS", "2", "vec", query_vector,
+        "SORTBY", "score",
+        "RETURN", "4", "title", "brief_description", "detailed_description", "score",
+        "LIMIT", "0", str(max_results),
+        "DIALECT", "2"
+    )
+
+    return result
+
+
+def parse_recommendation_search_results(result, exclude_titles=None):
+    """Parse Redis search results into recommendation objects"""
+    recommendations = []
+
+    if exclude_titles is None:
+        exclude_titles = []
+    elif isinstance(exclude_titles, str):
+        exclude_titles = [exclude_titles]
+
+    if result and len(result) > 1:
+        i = 1
+        while i < len(result):
+            key = result[i]
+            i += 1
+
+            if i < len(result) and isinstance(result[i], list):
+                fields = result[i]
+                i += 1
+
+                field_dict = {}
+                for j in range(0, len(fields), 2):
+                    if j + 1 < len(fields):
+                        field_name = fields[j]
+                        field_value = fields[j + 1]
+
+                        if isinstance(field_name, bytes):
+                            field_name = field_name.decode()
+                        if isinstance(field_value, bytes):
+                            field_value = field_value.decode()
+
+                        field_dict[field_name] = field_value
+
+                title = field_dict.get("title", "")
+                if title in exclude_titles:
+                    continue
+
+                recommendations.append({
+                    "title": title,
+                    "brief_description": field_dict.get("brief_description", ""),
+                    "detailed_description": field_dict.get("detailed_description", ""),
+                    "score": float(field_dict.get("score", 0))
+                })
+            else:
+                continue
+
+    return recommendations
+
+
 # AUTH MODELS
 class RegisterIn(BaseModel):
     name: str = Field(..., min_length=2, max_length=60)
@@ -199,6 +308,25 @@ class SongRecommendation(BaseModel):
     period: str
     mp3_url: str
     similarity_score: float
+
+
+class SleepRecommendation(BaseModel):
+    title: str
+    brief_description: str
+    detailed_description: str
+    embedding: Optional[List[float]] = None
+
+
+class SimilarSleepRecommendation(BaseModel):
+    title: str
+    brief_description: str
+    similarity_score: float
+
+
+class SleepRecommendationRequest(BaseModel):
+    recommendation_titles: List[str] = Field(..., description="List of recommendation titles to find similar ones for")
+    k: int = Field(default=50, ge=1, le=100, description="Number of similar recommendations to search for")
+    max_results: int = Field(default=20, ge=1, le=50, description="Maximum number of results to return")
 
 
 # ENDPOINTS
@@ -390,13 +518,10 @@ async def get_available_songs(
 
 
 @app.get("/api/songs/random", response_model=List[Song])
-async def get_random_songs_endpoint(
-        n: int = Query(default=5, ge=1, le=20, description="Number of random songs to retrieve")
-):
+async def get_random_songs_endpoint():
     """
-    Get random songs from the Redis database
-    Returns: List of songs with title, composer (author), and mp3_url
-    - **n**: Number of songs to retrieve (1-20)
+    Get all songs from the Redis database in random order
+    Returns: List of all songs with title, composer (author), and mp3_url
     """
     try:
         keys = []
@@ -409,10 +534,11 @@ async def get_random_songs_endpoint(
                 detail="No songs found in database"
             )
 
-        selected_keys = random.sample(keys, min(n, len(keys)))
-        songs = []
+        # Shuffle all keys
+        random.shuffle(keys)
 
-        for key in selected_keys:
+        songs = []
+        for key in keys:
             song_data = r.hgetall(key)
             songs.append({
                 "title": song_data[b"title"].decode(),
@@ -429,7 +555,7 @@ async def get_random_songs_endpoint(
         )
 
 
-@app.get("/api/recommendations", response_model=List[Recommendation])
+@app.get("/api/sleep/recommendations", response_model=List[Recommendation])
 async def get_recommendations():
     """
     Get all sleep recommendations
@@ -712,6 +838,110 @@ async def receive_sleep_session(session: SleepSessionData):
         },
         "directory": str(session_dir)
     }
+
+
+@app.get("/api/sleep/random", response_model=List[SleepRecommendation])
+async def get_all_sleep_recommendations_random():
+    """
+    Get ALL sleep recommendations from Redis in random order
+    Returns: List of all sleep recommendations with title and descriptions in random order
+    """
+    try:
+        keys = []
+        for key in r.scan_iter("sleep:*"):
+            keys.append(key)
+
+        if not keys:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No sleep recommendations found in database"
+            )
+
+        # Shuffle all keys
+        random.shuffle(keys)
+
+        recommendations = []
+        for key in keys:
+            data = r.hgetall(key)
+            recommendations.append({
+                "title": data[b"title"].decode(),
+                "brief_description": data[b"brief_description"].decode(),
+                "detailed_description": data[b"detailed_description"].decode()
+            })
+
+        return recommendations
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving recommendations: {str(e)}"
+        )
+
+
+@app.post("/api/sleep/recommend", response_model=List[SimilarSleepRecommendation])
+async def get_similar_sleep_recommendations(request: SleepRecommendationRequest):
+    """
+    Get sleep recommendations similar to multiple selected recommendations using vector similarity
+    Uses the average of all selected recommendation embeddings to find similar ones
+    """
+    try:
+        # Find all reference recommendations
+        reference_embeddings = []
+        reference_titles_found = []
+
+        for title in request.recommendation_titles:
+            for key in r.scan_iter("sleep:*"):
+                data = r.hgetall(key)
+                if data[b"title"].decode() == title:
+                    embedding_bytes = data[b"embedding"]
+                    embedding_array = np.frombuffer(embedding_bytes, dtype=np.float32)
+                    reference_embeddings.append(embedding_array)
+                    reference_titles_found.append(title)
+                    break
+
+        if not reference_embeddings:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"None of the provided recommendations were found"
+            )
+
+        # Average all embeddings to create composite query vector
+        composite_embedding = np.mean(reference_embeddings, axis=0).tolist()
+
+        total_recommendations = get_total_sleep_recommendations()
+
+        # Search for similar recommendations
+        result = search_similar_recommendations(
+            embedding_query=composite_embedding,
+            k=total_recommendations * 2 if total_recommendations > 0 else 1000,
+            max_results=total_recommendations if total_recommendations > 0 else 1000
+        )
+
+        # Parse results with all reference titles excluded
+        recommendations = parse_recommendation_search_results(
+            result,
+            exclude_titles=request.recommendation_titles
+        )
+
+        # Format for response
+        formatted_recommendations = [
+            {
+                "title": rec["title"],
+                "brief_description": rec["brief_description"],
+                "similarity_score": rec["score"]
+            }
+            for rec in recommendations
+        ]
+
+        return formatted_recommendations
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error generating similar recommendations: {str(e)}"
+        )
 
 
 if __name__ == "__main__":
