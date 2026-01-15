@@ -295,11 +295,11 @@ class SleepScore(BaseModel):
 
 class SleepSessionData(BaseModel):
     username: str
-    startTime: str
-    endTime: str
+    startTime: int
+    endTime: int
     duration: int
-    audioData: List[dict]
-    motionData: List[dict]
+    audioData: List[dict]   # snore / noise events
+    motionData: List[dict]  # movement events
     lightData: List[dict]
     summary: dict
 
@@ -753,103 +753,32 @@ async def receive_user_settings(settings: UserSettings):
     return {"status": "success", "message": "Settings data received"}
 
 
-@app.post("/api/user/pin-recommendation")
-async def pin_recommendation(pin_action: PinAction):
-    """
-    Log when a user pins/unpins a recommendation
-    """
-    print("\n" + "=" * 50)
-    print(f"USER PIN ACTION:")
-    print(f"Username: {pin_action.username}")
-    print(f"Recommendation: {pin_action.recommendation_title} (ID: {pin_action.recommendation_id})")
-    print(f"Action: {'PINNED' if pin_action.pinned else 'UNPINNED'}")
-    print("=" * 50 + "\n")
-
-    return {
-        "status": "success",
-        "message": "Pin action logged",
-        "action": pin_action
-    }
-
-
 @app.post("/api/sleep/session")
 async def receive_sleep_session(session: SleepSessionData):
-    """
-    Receive complete sleep session data from frontend and save to disk
-    """
     print("\n" + "=" * 50)
-    print("RECEIVED SLEEP SESSION DATA:")
-    print(f"Username: {session.username}")
-    print(f"Start Time: {session.startTime}")
-    print(f"End Time: {session.endTime}")
-    print(f"Duration: {session.duration / 1000 / 60:.2f} minutes")
-    print(f"Motion Events: {len(session.motionData)}")
-    print(f"Light Readings: {len(session.lightData)}")
+    print("SLEEP SESSION RECEIVED")
+    print(f"User: {session.username}")
+    print(f"Duration: {session.duration / 1000 / 60:.2f} min")
+    print(f"Snores: {len(session.audioData)}")
+    print(f"Movements: {len(session.motionData)}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     session_dir = Path(f"data/{session.username}/{timestamp}")
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    audio_saved = False
-    if session.audioData and len(session.audioData) > 0:
-        audio_entry = session.audioData[0]
-        audio_base64 = audio_entry.get('audioFileBase64', '')
-        if audio_base64:
-            try:
-                audio_path = session_dir / "audio.m4a"
-                with open(audio_path, "wb") as f:
-                    f.write(base64.b64decode(audio_base64))
-                audio_saved = True
-                print(f"Audio file saved: {audio_path}")
-            except Exception as e:
-                print(f"Failed to save audio file: {e}")
+    with open(session_dir / "audio_events.json", "w") as f:
+        json.dump(session.audioData, f, indent=2)
 
-    try:
-        motion_path = session_dir / "motion.json"
-        with open(motion_path, "w") as f:
-            json.dump(session.motionData, f, indent=2)
-        print(f"Motion data saved: {motion_path}")
-    except Exception as e:
-        print(f"Failed to save motion data: {e}")
+    with open(session_dir / "motion_events.json", "w") as f:
+        json.dump(session.motionData, f, indent=2)
 
-    try:
-        light_path = session_dir / "light.json"
-        with open(light_path, "w") as f:
-            json.dump(session.lightData, f, indent=2)
-        print(f"Light data saved: {light_path}")
-    except Exception as e:
-        print(f"Failed to save light data: {e}")
+    with open(session_dir / "summary.json", "w") as f:
+        json.dump(session.summary, f, indent=2)
 
-    try:
-        session_path = session_dir / "session.json"
-        session_metadata = {
-            "startTime": session.startTime,
-            "endTime": session.endTime,
-            "duration": session.duration,
-            "summary": session.summary,
-            "username": session.username
-        }
-        with open(session_path, "w") as f:
-            json.dump(session_metadata, f, indent=2)
-        print(f"Session metadata saved: {session_path}")
-    except Exception as e:
-        print(f"Failed to save session metadata: {e}")
+    print("Session saved ✔")
+    print("=" * 50)
 
-    print(f"Audio File: {'Yes' if audio_saved else 'No'}")
-    print("=" * 50 + "\n")
-
-    return {
-        "status": "success",
-        "message": "Sleep session received and saved to disk",
-        "session_id": f"session_{datetime.now().isoformat()}",
-        "files_saved": {
-            "audio": audio_saved,
-            "motion": True,
-            "light": True,
-            "session": True
-        },
-        "directory": str(session_dir)
-    }
+    return {"status": "success"}
 
 
 @app.get("/api/sleep/random", response_model=List[SleepRecommendation])
