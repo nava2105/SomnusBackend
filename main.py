@@ -108,7 +108,7 @@ def get_random_sleep_recommendations(n=5):
         keys.append(key)
 
     if not keys:
-        print("⚠ No sleep recommendations found in Redis")
+        print("⚠️ No sleep recommendations found in Redis")
         return []
 
     selected_keys = random.sample(keys, min(n, len(keys)))
@@ -116,8 +116,12 @@ def get_random_sleep_recommendations(n=5):
 
     for key in selected_keys:
         data = r.hgetall(key)
+        # Extract ID from key (e.g., "sleep:123" -> "123")
+        rec_id = key.decode() if isinstance(key, bytes) else key
+        rec_id = rec_id.split(":")[-1]  # Get the number after "sleep:"
 
         recommendations.append({
+            "id": rec_id,
             "title": data[b"title"].decode(),
             "brief_description": data[b"brief_description"].decode(),
             "detailed_description": data[b"detailed_description"].decode()
@@ -164,6 +168,10 @@ def parse_recommendation_search_results(result, exclude_titles=None):
             key = result[i]
             i += 1
 
+            # Extract ID from key
+            rec_id = key.decode() if isinstance(key, bytes) else key
+            rec_id = rec_id.split(":")[-1]
+
             if i < len(result) and isinstance(result[i], list):
                 fields = result[i]
                 i += 1
@@ -186,6 +194,7 @@ def parse_recommendation_search_results(result, exclude_titles=None):
                     continue
 
                 recommendations.append({
+                    "id": rec_id,
                     "title": title,
                     "brief_description": field_dict.get("brief_description", ""),
                     "detailed_description": field_dict.get("detailed_description", ""),
@@ -311,6 +320,7 @@ class SongRecommendation(BaseModel):
 
 
 class SleepRecommendation(BaseModel):
+    id: str  # ADD THIS FIELD
     title: str
     brief_description: str
     detailed_description: str
@@ -318,8 +328,10 @@ class SleepRecommendation(BaseModel):
 
 
 class SimilarSleepRecommendation(BaseModel):
+    id: str  # ADD THIS FIELD
     title: str
     brief_description: str
+    detailed_description: str  # ADD THIS FIELD
     similarity_score: float
 
 
@@ -844,7 +856,7 @@ async def receive_sleep_session(session: SleepSessionData):
 async def get_all_sleep_recommendations_random():
     """
     Get ALL sleep recommendations from Redis in random order
-    Returns: List of all sleep recommendations with title and descriptions in random order
+    Returns: List of all sleep recommendations with id, title and descriptions in random order
     """
     try:
         keys = []
@@ -863,7 +875,12 @@ async def get_all_sleep_recommendations_random():
         recommendations = []
         for key in keys:
             data = r.hgetall(key)
+            # Extract ID from key (e.g., "sleep:123" -> "123")
+            rec_id = key.decode() if isinstance(key, bytes) else key
+            rec_id = rec_id.split(":")[-1]
+
             recommendations.append({
+                "id": rec_id,
                 "title": data[b"title"].decode(),
                 "brief_description": data[b"brief_description"].decode(),
                 "detailed_description": data[b"detailed_description"].decode()
@@ -923,11 +940,13 @@ async def get_similar_sleep_recommendations(request: SleepRecommendationRequest)
             exclude_titles=request.recommendation_titles
         )
 
-        # Format for response
+        # Format for response - NOW INCLUDING ID
         formatted_recommendations = [
             {
+                "id": rec["id"],
                 "title": rec["title"],
                 "brief_description": rec["brief_description"],
+                "detailed_description": rec["detailed_description"],
                 "similarity_score": rec["score"]
             }
             for rec in recommendations
