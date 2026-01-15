@@ -546,11 +546,11 @@ async def get_random_songs_endpoint():
                 detail="No songs found in database"
             )
 
-        # Shuffle all keys
-        random.shuffle(keys)
+        # Shuffle all keys and select 5
+        selected_keys = random.sample(keys, min(5, len(keys)))
 
         songs = []
-        for key in keys:
+        for key in selected_keys:
             song_data = r.hgetall(key)
             songs.append({
                 "title": song_data[b"title"].decode(),
